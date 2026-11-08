@@ -55,7 +55,6 @@ func (s *Store) ListProducts(ctx context.Context) ([]domain.Product, error) {
 	return products, rows.Err()
 }
 
-
 func (s *Store) CreateOrder(ctx context.Context, input domain.CreateOrderInput) (domain.Order, error) {
 	if input.CustomerEmail == "" || len(input.Items) == 0 {
 		return domain.Order{}, ErrInvalidInput

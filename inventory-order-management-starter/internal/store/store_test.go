@@ -269,3 +269,79 @@ func TestCancelOrder(t *testing.T) {
 		checkState(t, ctx, pool, f, "created", []int{8, 2147483647})
 	})
 }
+
+func TestCancelOrderSharedProducts(t *testing.T) {
+	pool := testPool(t)
+	s := New(pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Заказ А владеет тестовыми товарами:
+	// остатки 5 и 10, возвращаемые количества 2 и 1.
+	a := createFixture(t, ctx, pool, []testItem{
+		{stock: 5, quantity: 2},
+		{stock: 10, quantity: 1},
+	})
+
+	// Заказ Б использует те же товары.
+	// Он создан позже, поэтому его cleanup выполнится раньше cleanup А.
+	b := createFixture(t, ctx, pool, nil)
+
+	// Позиции Б записываем в обратном порядке ID товаров.
+	for _, item := range []struct {
+		productID int64
+		quantity  int
+	}{
+		{productID: a.productIDs[1], quantity: 4},
+		{productID: a.productIDs[0], quantity: 3},
+	} {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO order_items
+				(order_id, product_id, product_name, quantity, unit_price_cents)
+			VALUES ($1, $2, 'Test product', $3, 100)
+		`, b.orderID, item.productID, item.quantity)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	for _, id := range []int64{a.orderID, b.orderID} {
+		wg.Add(1)
+
+		go func(orderID int64) {
+			defer wg.Done()
+			<-start
+			results <- s.CancelOrder(ctx, orderID)
+		}(id)
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if err != nil {
+			t.Errorf("cancel shared-products order: %v", err)
+		}
+	}
+
+	// 5 + 2 + 3 = 10.
+	// 10 + 1 + 4 = 15.
+	checkState(t, ctx, pool, a, "cancelled", []int{10, 15})
+	checkState(t, ctx, pool, b, "cancelled", nil)
+
+	// Повторная отмена обоих заказов ничего не возвращает.
+	for _, id := range []int64{a.orderID, b.orderID} {
+		if err := s.CancelOrder(ctx, id); err != nil {
+			t.Fatalf("repeat cancellation of order %d: %v", id, err)
+		}
+	}
+
+	checkState(t, ctx, pool, a, "cancelled", []int{10, 15})
+	checkState(t, ctx, pool, b, "cancelled", nil)
+}
