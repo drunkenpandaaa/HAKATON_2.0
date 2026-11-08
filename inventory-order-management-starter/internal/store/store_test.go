@@ -345,3 +345,163 @@ func TestCancelOrderSharedProducts(t *testing.T) {
 	checkState(t, ctx, pool, a, "cancelled", []int{10, 15})
 	checkState(t, ctx, pool, b, "cancelled", nil)
 }
+
+func TestCancelOrderContextCancelledWhileLocked(t *testing.T) {
+	pool := testPool(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	f := createFixture(t, ctx, pool, []testItem{
+		{stock: 8, quantity: 2},
+	})
+
+	// Отдельный пул только для проверяемого CancelOrder.
+	// Одно соединение позволяет обнаружить утечку:
+	// если оно останется занятым, следующий запрос не выполнится.
+	cfg := pool.Config()
+	cfg.MaxConns = 1
+	cfg.MinConns = 0
+
+	workerPool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(workerPool.Close)
+
+	var workerPID int32
+	err = workerPool.QueryRow(ctx, `SELECT pg_backend_pid()`).
+		Scan(&workerPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(workerPool)
+
+	// Заранее блокируем заказ другой транзакцией.
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = blocker.Rollback(cleanupCtx)
+	}()
+
+	var blockerPID int32
+	err = blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).
+		Scan(&blockerPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var status string
+	err = blocker.QueryRow(ctx, `
+		SELECT status
+		FROM orders
+		WHERE id = $1
+		FOR UPDATE
+	`, f.orderID).Scan(&status)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestCtx, requestCancel := context.WithCancel(ctx)
+	result := make(chan error, 1)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		result <- s.CancelOrder(requestCtx, f.orderID)
+	}()
+
+	// Даже если проверка упадёт, отменяем вызов и ждём его завершения.
+	defer func() {
+		requestCancel()
+		select {
+		case <-done:
+		case <-time.After(7 * time.Second):
+			t.Error("CancelOrder did not finish during cleanup")
+		}
+	}()
+
+	// Подтверждаем реальное ожидание блокировки в PostgreSQL.
+	waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer waitCancel()
+
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		var blocked bool
+		err := pool.QueryRow(waitCtx, `
+			SELECT $1::integer = ANY(pg_blocking_pids($2::integer))
+		`, blockerPID, workerPID).Scan(&blocked)
+		if err != nil {
+			t.Fatalf("observe lock wait: %v", err)
+		}
+		if blocked {
+			break
+		}
+
+		select {
+		case err := <-result:
+			t.Fatalf("CancelOrder returned before waiting for lock: %v", err)
+		case <-waitCtx.Done():
+			t.Fatal("CancelOrder was not observed waiting for the lock")
+		case <-ticker.C:
+		}
+	}
+
+	// Заказ всё ещё заблокирован. Отменяем именно контекст запроса.
+	requestCancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("CancelOrder did not stop after context cancellation")
+	}
+
+	checkState(t, ctx, pool, f, "created", []int{8})
+
+	// Проверяем, что единственный слот пула доступен,
+	// а полученное соединение не находится внутри транзакции.
+	probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer probeCancel()
+
+	conn, err := workerPool.Acquire(probeCtx)
+	if err != nil {
+		t.Fatalf("pool connection was not released: %v", err)
+	}
+
+	txStatus := conn.Conn().PgConn().TxStatus()
+	var one int
+	probeErr := conn.QueryRow(probeCtx, `SELECT 1`).Scan(&one)
+	conn.Release()
+
+	if txStatus != 'I' {
+		t.Fatalf("connection transaction status = %q, want idle", txStatus)
+	}
+	if probeErr != nil {
+		t.Fatalf("connection is not usable: %v", probeErr)
+	}
+	if one != 1 {
+		t.Fatalf("SELECT 1 returned %d", one)
+	}
+
+	// Снимаем нашу блокировку и проверяем обычную отмену.
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.CancelOrder(ctx, f.orderID); err != nil {
+		t.Fatalf("cancellation after releasing lock: %v", err)
+	}
+	checkState(t, ctx, pool, f, "cancelled", []int{10})
+}
