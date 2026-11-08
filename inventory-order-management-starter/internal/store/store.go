@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
-	"slices"
-
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"math"
+	"slices"
+	"time"
 
 	"github.com/hackathon/inventory-order-management/internal/domain"
 )
@@ -55,7 +55,6 @@ func (s *Store) ListProducts(ctx context.Context) ([]domain.Product, error) {
 	}
 	return products, rows.Err()
 }
-
 
 func (s *Store) CreateOrder(ctx context.Context, input domain.CreateOrderInput) (domain.Order, error) {
 	if input.CustomerEmail == "" || len(input.Items) == 0 {
@@ -190,44 +189,105 @@ func (s *Store) GetOrder(ctx context.Context, id int64) (domain.Order, error) {
 }
 
 func (s *Store) CancelOrder(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.ReadCommitted,
+	})
+	if err != nil {
+		return fmt.Errorf("begin cancel order: %w", err)
+	}
+
+	// При любом выходе завершаем незавершённую транзакцию.
+	// Используем отдельный контекст: контекст запроса мог отмениться.
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cancel()
+		_ = tx.Rollback(cleanupCtx)
+	}()
+
 	var status string
-	err := s.db.QueryRow(ctx, `SELECT status FROM orders WHERE id = $1`, id).Scan(&status)
+	err = tx.QueryRow(ctx, `
+		SELECT status
+		FROM orders
+		WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("lock order: %w", err)
 	}
+
 	if status == "cancelled" {
 		return nil
 	}
+	if status != "created" {
+		return fmt.Errorf("unexpected order status: %q", status)
+	}
 
-	rows, err := s.db.Query(ctx, `
-		SELECT product_id, quantity FROM order_items WHERE order_id = $1
+	rows, err := tx.Query(ctx, `
+		SELECT product_id, quantity
+		FROM order_items
+		WHERE order_id = $1
+		ORDER BY product_id, id
 	`, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("read order items: %w", err)
 	}
-	type line struct { productID int64; quantity int }
+
+	type line struct {
+		productID int64
+		quantity  int
+	}
+
 	var lines []line
 	for rows.Next() {
 		var l line
 		if err := rows.Scan(&l.productID, &l.quantity); err != nil {
 			rows.Close()
-			return err
+			return fmt.Errorf("scan order item: %w", err)
 		}
 		lines = append(lines, l)
 	}
 	rows.Close()
 
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate order items: %w", err)
+	}
+
 	for _, l := range lines {
-		_, err := s.db.Exec(ctx, `
-			UPDATE products SET stock = stock + $1 WHERE id = $2
+		if l.quantity <= 0 {
+			return fmt.Errorf("invalid stored quantity for product %d", l.productID)
+		}
+
+		tag, err := tx.Exec(ctx, `
+			UPDATE products
+			SET stock = stock + $1
+			WHERE id = $2
 		`, l.quantity, l.productID)
 		if err != nil {
-			return err
+			return fmt.Errorf("restore product %d stock: %w", l.productID, err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("product %d missing during cancellation", l.productID)
 		}
 	}
-	_, err = s.db.Exec(ctx, `UPDATE orders SET status = 'cancelled' WHERE id = $1`, id)
-	return err
+
+	_, err = tx.Exec(ctx, `
+		UPDATE orders
+		SET status = 'cancelled'
+		WHERE id = $1
+	`, id)
+	if err != nil {
+		return fmt.Errorf("update order status: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit cancel order: %w", err)
+	}
+
+	return nil
 }
