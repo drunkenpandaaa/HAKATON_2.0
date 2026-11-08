@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -253,8 +254,15 @@ func TestCancelOrder(t *testing.T) {
 		})
 
 		// Второе обновление вызовет переполнение PostgreSQL INTEGER.
-		if err := s.CancelOrder(ctx, f.orderID); err == nil {
-			t.Fatal("expected an error")
+		err := s.CancelOrder(ctx, f.orderID)
+
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			t.Fatalf("expected PostgreSQL error, got %v", err)
+		}
+		if pgErr.Code != "22003" {
+			t.Fatalf("expected numeric overflow (22003), got %s: %v",
+				pgErr.Code, err)
 		}
 
 		// Первое обновление тоже должно откатиться.
