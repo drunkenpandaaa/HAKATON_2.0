@@ -1,4 +1,4 @@
-## Интеграционные тесты отмены
+## Интеграционные тесты отмены и создания заказов
 
 Тесты используют настоящую PostgreSQL и отдельную базу `inventory_test`.
 Новый контейнер PostgreSQL не требуется.
@@ -50,7 +50,9 @@ docker compose exec -T postgres \
 ```bash
 export TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/inventory_test?sslmode=disable'
 ```
-
+```powershell
+$env:TEST_DATABASE_URL = "postgres://postgres:postgres@localhost:5432/inventory_test?sslmode=disable"
+```
 Этот адрес подходит при запуске тестов на хосте с опубликованным портом
 PostgreSQL `5432`. При другом внешнем порте измените строку подключения.
 Указанные учётные данные предназначены для локального окружения проекта.
@@ -77,6 +79,7 @@ go vet ./...
 ```
 
 Без `TEST_DATABASE_URL` интеграционные тесты пропускаются (`SKIP`).
+Тесты CreateOrder используют фиксированную локальную тестовую базу inventory_test и не пропускаются при отсутствии этой переменной.
 Успешный запуск команды с пропущенными тестами не подтверждает
 корректность отмены.
 
@@ -106,3 +109,41 @@ go vet ./...
 по итоговым остаткам, статусам и возвращаемым ошибкам.
 Повторные конкурентные прогоны не являются доказательством
 отсутствия всех возможных ошибок конкуренции.
+
+
+### Тестирование CreateOrder
+
+Тесты используют реальную PostgreSQL и базу `inventory_test`.
+Все команды выполняются из каталога `inventory-order-management-starter`.
+
+Для запуска тестов создания заказа:
+
+```bash
+go test ./internal/store -run '^(TestCreateOrder|TestConcurrentCreateOrder)' -v -count=1
+```
+
+Для повторной проверки конкурентных сценариев:
+
+```bash
+go test ./internal/store -run '^TestConcurrentCreateOrder' -count=100 -timeout=2m
+```
+
+Проверка всех тестов с детектором гонок Go:
+
+```bash
+go test -race ./... -count=1 -timeout=2m
+```
+
+Проверяемые сценарии:
+
+- `TestCreateOrder` — обычное создание заказа, расчёт стоимости и уменьшение остатка.
+- `TestConcurrentCreateOrder` — 20 конкурентных попыток купить последнюю единицу товара. Ожидается один успешный заказ.
+- `TestCreateOrderDuplicateItems` — объединение повторяющихся товаров, проверка количества, суммы и остатка.
+- `TestConcurrentCreateOrderTwo` — два одновременных заказа с противоположным порядком товаров.
+
+Тесты CreateOrder подключаются напрямую к локальной базе
+`inventory_test` через `localhost:5432`. Переменная
+`TEST_DATABASE_URL` для них пока не используется.
+
+В отличие от тестов CancelOrder, при недоступной тестовой
+базе они завершаются ошибкой, а не пропускаются.
